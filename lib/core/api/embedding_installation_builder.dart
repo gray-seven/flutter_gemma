@@ -4,6 +4,7 @@ import 'package:flutter_gemma/core/di/service_registry.dart';
 import 'package:flutter_gemma/core/utils/file_name_utils.dart';
 import 'package:flutter_gemma/flutter_gemma.dart';
 import 'package:path/path.dart' as path;
+import 'package:flutter_gemma/core/services/model_repository.dart' as repo;
 
 /// Fluent builder for embedding model installation
 ///
@@ -149,9 +150,9 @@ class EmbeddingInstallationBuilder {
     final registry = ServiceRegistry.instance;
     final repository = registry.modelRepository;
 
-    // Check if both model and tokenizer are already installed
-    final isModelInstalled = await repository.isInstalled(modelFilename);
-    final isTokenizerInstalled = await repository.isInstalled(tokenizerFilename);
+    // Check if both model and tokenizer are fully installed (metadata + file exists + correct size)
+    final isModelInstalled = await _isFileFullyInstalled(modelFilename, repository, registry);
+    final isTokenizerInstalled = await _isFileFullyInstalled(tokenizerFilename, repository, registry);
 
     if (isModelInstalled && isTokenizerInstalled) {
       debugPrint(
@@ -218,6 +219,86 @@ class EmbeddingInstallationBuilder {
       BundledSource(:final resourceName) => resourceName,
       FileSource(:final path) => path.split('/').last,
     };
+  }
+
+  /// Validates if a file is fully installed (metadata exists + file exists + correct size)
+  ///
+  /// Returns true only if:
+  /// 1. Model metadata exists in repository
+  /// 2. File actually exists on disk/storage
+  /// 3. File size matches the stored sizeBytes (or minimum size if stored size is 0)
+  Future<bool> _isFileFullyInstalled(
+    String filename,
+    repo.ModelRepository repository,
+    ServiceRegistry registry,
+  ) async {
+    try {
+      // 1. Check if metadata exists in repository
+      final hasMetadata = await repository.isInstalled(filename);
+      if (!hasMetadata) {
+        debugPrint('📋 No metadata found for: $filename');
+        return false;
+      }
+
+      // 2. Load metadata to get stored size
+      final modelInfo = await repository.loadModel(filename);
+      if (modelInfo == null) {
+        debugPrint('📋 Failed to load metadata for: $filename');
+        return false;
+      }
+
+      // 3. Check if file actually exists
+      final fileSystem = registry.fileSystemService;
+      final filePath = await fileSystem.getTargetPath(filename);
+      final fileExists = await fileSystem.fileExists(filePath);
+
+      if (!fileExists) {
+        debugPrint('📁 File not found on disk: $filename (metadata exists but file missing)');
+        // Clean up orphaned metadata
+        await repository.deleteModel(filename);
+        return false;
+      }
+
+      // 4. Validate file size
+      final actualSize = await fileSystem.getFileSize(filePath);
+      final storedSize = modelInfo.sizeBytes;
+
+      // For web, getFileSize returns -1 when size is unknown but file exists
+      // In that case, we trust the file exists
+      if (actualSize == -1) {
+        debugPrint('✅ File exists (web, size unknown): $filename');
+        return true;
+      }
+
+      // Check if file size matches stored size (with tolerance for small files)
+      if (storedSize > 0 && actualSize < storedSize) {
+        debugPrint(
+          '⚠️  File size mismatch: $filename (expected: $storedSize bytes, actual: $actualSize bytes)',
+        );
+        // File is incomplete - clean up
+        await repository.deleteModel(filename);
+        return false;
+      }
+
+      // Also check minimum size based on file extension
+      final extension = filename.contains('.') ? '.${filename.split('.').last}' : '';
+      final minSize = FileNameUtils.getMinimumSize(extension);
+
+      if (actualSize < minSize) {
+        debugPrint(
+          '⚠️  File too small: $filename (minimum: $minSize bytes, actual: $actualSize bytes)',
+        );
+        // File is too small (likely corrupted) - clean up
+        await repository.deleteModel(filename);
+        return false;
+      }
+
+      debugPrint('✅ File fully installed: $filename ($actualSize bytes)');
+      return true;
+    } catch (e) {
+      debugPrint('❌ Error validating file: $filename - $e');
+      return false;
+    }
   }
 }
 
